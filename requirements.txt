@@ -12,3 +12,6 @@ ipykernel>=6.0.0
 pytest>=7.0.0
 dask>=2023.0.0
 fsspec>=2023.0.0
+transformers>=4.0.0
+torch>=2.0.0
+langchain-text-splitters>=0.0.1
