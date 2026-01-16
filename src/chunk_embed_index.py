@@ -27,19 +27,78 @@ class ChunkEmbedIndex:
             model_name="all-MiniLM-L6-v2"
         )
 
-    def load_processed_data(self, nrows=None):
+    def load_processed_data(self, nrows=None, stratified=True):
         """
-        Loads the preprocessed data.
+        Loads the preprocessed data with optional stratified sampling.
+        
+        Args:
+            nrows (int): Total number of rows to load. If None, loads all data.
+            stratified (bool): If True, samples proportionally from each Product category.
         """
         print(f"Loading data from {self.data_path}...")
         if not os.path.exists(self.data_path):
             raise FileNotFoundError(f"File not found: {self.data_path}")
+        
+        if nrows is None or not stratified:
+            # Load all data or sequential sample
+            self.df = pd.read_csv(self.data_path, nrows=nrows)
+        else:
+            # Stratified sampling: load proportionally from each product
+            print(f"Using stratified sampling to load {nrows} rows...")
+            full_df = pd.read_csv(self.data_path)
             
-        self.df = pd.read_csv(self.data_path, nrows=nrows)
+            # Get product distribution
+            product_counts = full_df['Product'].value_counts()
+            total_available = len(full_df)
+            
+            print(f"\nTotal available rows: {total_available}")
+            print(f"Product distribution in full dataset:")
+            print(product_counts)
+            
+            # Calculate samples per product proportionally
+            samples_per_product = {}
+            for product, count in product_counts.items():
+                proportion = count / total_available
+                sample_size = int(nrows * proportion)
+                # Ensure at least 1 sample for each product
+                samples_per_product[product] = max(1, sample_size)
+            
+            print(f"\nSampling strategy:")
+            for product, sample_size in samples_per_product.items():
+                print(f"  {product}: {sample_size} rows")
+            
+            # Sample from each product
+            sampled_dfs = []
+            for product, sample_size in samples_per_product.items():
+                product_df = full_df[full_df['Product'] == product]
+                # Sample min of (requested, available) to avoid errors
+                actual_sample = min(sample_size, len(product_df))
+                sampled = product_df.sample(n=actual_sample, random_state=42)
+                sampled_dfs.append(sampled)
+            
+            self.df = pd.concat(sampled_dfs, ignore_index=True)
+            # Shuffle to mix products
+            self.df = self.df.sample(frac=1, random_state=42).reset_index(drop=True)
+            
         # Drop rows where cleaned_narrative might be NaN (just in case)
         self.df = self.df.dropna(subset=['cleaned_narrative'])
-        print(f"Loaded {len(self.df)} rows.")
+        print(f"\n✓ Loaded {len(self.df)} rows.")
         return self.df
+    
+    def get_sample_stats(self):
+        """
+        Returns statistics about the loaded sample.
+        """
+        if self.df is None:
+            return "No data loaded."
+        
+        stats = {
+            "total_rows": len(self.df),
+            "product_distribution": self.df['Product'].value_counts().to_dict(),
+            "avg_narrative_length_words": self.df['cleaned_narrative'].apply(lambda x: len(str(x).split())).mean(),
+            "avg_narrative_length_chars": self.df['cleaned_narrative'].apply(lambda x: len(str(x))).mean()
+        }
+        return stats
 
     def initialize_vector_store(self):
         """
@@ -66,14 +125,22 @@ class ChunkEmbedIndex:
         )
         print(f"Created collection: {self.collection_name}")
 
-    def process_and_index(self, chunk_size=500, chunk_overlap=50, batch_size=100):
+    def process_and_index(self, chunk_size=1100, chunk_overlap=275, batch_size=100):
         """
         Chunks the text, and inserts into ChromaDB in batches.
+        
+        Args:
+            chunk_size (int): Characters per chunk. Default 1100 (~200 words).
+            chunk_overlap (int): Character overlap between chunks. Default 275 (~50 words).
+            batch_size (int): Number of chunks to insert per batch.
         """
         if self.df is None:
             raise ValueError("Data not loaded. Call load_processed_data() first.")
             
         print("Initializing Text Splitter...")
+        print(f"Chunk size: {chunk_size} characters (~{chunk_size//5.5:.0f} words)")
+        print(f"Chunk overlap: {chunk_overlap} characters (~{chunk_overlap//5.5:.0f} words)")
+        
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
@@ -91,6 +158,7 @@ class ChunkEmbedIndex:
         metadatas = []
         
         count = 0
+        chunks_per_product = {}  # Track chunks by product
         
         for idx, row in tqdm(self.df.iterrows(), total=len(self.df), desc="Processing Complaints"):
             complaint_id = str(row.get('Complaint ID', f"row_{idx}"))
@@ -103,6 +171,11 @@ class ChunkEmbedIndex:
                 
             # Chunking
             chunks = text_splitter.split_text(text)
+            
+            # Track chunks per product
+            if product not in chunks_per_product:
+                chunks_per_product[product] = 0
+            chunks_per_product[product] += len(chunks)
             
             for i, chunk in enumerate(chunks):
                 chunk_id = f"{complaint_id}_chunk_{i}"
@@ -137,7 +210,12 @@ class ChunkEmbedIndex:
             )
             count += len(ids)
             
-        print(f"Indexing Complete. Total Chunks Indexed: {count}")
+        print(f"\n✓ Indexing Complete. Total Chunks Indexed: {count}")
+        print(f"\nChunks per product:")
+        for product, chunk_count in sorted(chunks_per_product.items()):
+            print(f"  {product}: {chunk_count} chunks")
+        
+        return {"total_chunks": count, "chunks_per_product": chunks_per_product}
 
 if __name__ == "__main__":
     # Test run
@@ -148,9 +226,11 @@ if __name__ == "__main__":
     indexer = ChunkEmbedIndex(data_path)
     # Load a sample to test
     try:
-        indexer.load_processed_data(nrows=10000) 
+        indexer.load_processed_data(nrows=15000, stratified=True) 
+        print("\nSample statistics:")
+        print(indexer.get_sample_stats())
         indexer.initialize_vector_store()
-        indexer.process_and_index()
+        indexer.process_and_index(chunk_size=1100, chunk_overlap=275)
     except FileNotFoundError as e:
         print(e)
         print("Please run processed_data extraction first.")
